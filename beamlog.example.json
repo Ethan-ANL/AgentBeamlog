@@ -1,0 +1,15 @@
+{
+  "_README": "Copy to beamlog.json (gitignored) and edit. Each key is optional; env vars BEAMLOG_DB / BEAMLOG_SPEC_LOG / BEAMLOG_DATA_ROOT / BEAMLOG_LOG_GLOB override these. Use placeholder paths here; put real paths only in your local beamlog.json.",
+
+  "_db": "Path to the SQLite database. If omitted, defaults to <data_root>/beamlog.db so the corpus lives beside the data.",
+  "db": "/path/to/Data/beamlog.db",
+
+  "_spec_log": "Option A: one exact SPEC session log to read.",
+  "spec_log": "/path/to/Data/<run>/<user>/<experiment>/logs/<session>.log",
+
+  "_data_root": "Option B (instead of spec_log): a base folder to search. The newest matching file is used, so it follows the current experiment automatically.",
+  "data_root": "/path/to/Data",
+
+  "_log_glob": "Glob under data_root (recursive). Default '**/*.log'. Files containing 'scanlist' are ignored.",
+  "log_glob": "**/logs/*.log"
+}

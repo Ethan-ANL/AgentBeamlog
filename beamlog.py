@@ -14,11 +14,11 @@ that file -- no wrapper, no macro, no change to how they work.
 Typical flow:
 
   # once, at the start of an experiment
-  bl experiment --user jwkim --material "CrI3 / Br3" \
+  bl experiment --user alice --material "sample X" \
                 --technique "single-crystal XRD" --goal "align (0 0 L) rod"
 
   # follow SPEC's log live; every command lands in the DB automatically
-  bl tail /path/to/.../logs/crixbr3-x_1.log
+  bl tail /path/to/data/.../logs/session.log     # or just: bl tail  (resolved from config)
 
   # (or one-shot import an existing log)
   bl ingest /path/to/spec_log.txt
@@ -33,12 +33,16 @@ Typical flow:
   bl log "ascan tth 20 40 100 1" --why "..."     # manual, e.g. for an agent
 
 log / tail / ingest / recent default to the most recent experiment (--exp N to pick).
-DB is ./beamlog.db (override with $BEAMLOG_DB).
+
+Paths are never hardcoded -- the DB and the SPEC log are resolved from a config
+file (beamlog.json, gitignored) or env vars; see `beamlog.py resolve` and
+beamlog.example.json. The DB defaults into the Data folder, beside the data.
 """
 
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import re
@@ -47,7 +51,107 @@ import sys
 import time
 from datetime import datetime
 
-DB_PATH = os.environ.get("BEAMLOG_DB", os.path.join(os.getcwd(), "beamlog.db"))
+# --------------------------------------------------------------------------- #
+# configuration -- nothing about any site's directory layout is baked into the
+# code. The two paths are independent settings, each resolved by precedence:
+#   CLI arg (where applicable) > env var > config file (beamlog.json) > default
+# beamlog.json is gitignored.
+#
+#   db        -> the SQLite database          ($BEAMLOG_DB / "db")
+#   spec log  -> the SPEC session transcript  ($BEAMLOG_SPEC_LOG / "spec_log",
+#                or $BEAMLOG_DATA_ROOT / "data_root" + a glob)
+#
+# By default the DB lives in the Data folder (data_root), beside the data it
+# describes -- not in this repo.
+# --------------------------------------------------------------------------- #
+
+def _load_config() -> dict:
+    path = os.environ.get("BEAMLOG_CONFIG", os.path.join(os.getcwd(), "beamlog.json"))
+    if os.path.isfile(path):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception as e:  # noqa: BLE001 - config is best-effort
+            print(f"warning: could not read {path}: {e}", file=sys.stderr)
+    return {}
+
+
+CONFIG = _load_config()
+
+
+def _setting(key: str, env: str, default=None):
+    """A single setting, resolved env var > config file > default."""
+    if env in os.environ:
+        return os.environ[env]
+    if key in CONFIG:
+        return CONFIG[key]
+    return default
+
+
+def resolve_data_root():
+    root = _setting("data_root", "BEAMLOG_DATA_ROOT")
+    return os.path.expanduser(root) if root else None
+
+
+def resolve_db() -> str:
+    """Path to the SQLite DB. Explicit setting wins; otherwise it defaults
+    into the Data folder so the corpus lives beside the experiment data."""
+    db = _setting("db", "BEAMLOG_DB")
+    if db:
+        return os.path.expanduser(db)
+    root = resolve_data_root()
+    if root:
+        return os.path.join(root, "beamlog.db")
+    return os.path.join(os.getcwd(), "beamlog.db")
+
+
+def resolve_logfile(arg: str | None = None):
+    """Find the SPEC log to read, without hardcoding any layout.
+
+    Precedence:
+      1. an explicit path argument
+      2. $BEAMLOG_SPEC_LOG / config "spec_log"          (one exact file)
+      3. $BEAMLOG_DATA_ROOT / config "data_root" + a glob -- picks the
+         most-recently-modified match, so it follows the *current* experiment.
+    Returns (path, how) or (None, None) if nothing is configured/found.
+    """
+    if arg:
+        return os.path.abspath(os.path.expanduser(arg)), "argument"
+
+    explicit = _setting("spec_log", "BEAMLOG_SPEC_LOG")
+    if explicit:
+        return os.path.abspath(os.path.expanduser(explicit)), "spec_log"
+
+    root = resolve_data_root()
+    if root:
+        pattern = _setting("log_glob", "BEAMLOG_LOG_GLOB", "**/*.log")
+        matches = [
+            p for p in glob.glob(os.path.join(root, pattern), recursive=True)
+            if "scanlist" not in os.path.basename(p).lower()  # SPEC's scan *list*, not the session log
+        ]
+        if matches:
+            return max(matches, key=os.path.getmtime), "data_root (newest match)"
+
+    return None, None
+
+
+DB_PATH = resolve_db()
+
+
+def _need_logfile(arg):
+    """Resolve a logfile or print actionable guidance and return None."""
+    path, _how = resolve_logfile(arg)
+    if path is None:
+        print(
+            "no SPEC log configured. Do one of:\n"
+            "  - pass the path:    beamlog.py tail /path/to/session.log\n"
+            "  - set an env var:   export BEAMLOG_SPEC_LOG=/path/to/session.log\n"
+            "  - or a search root: export BEAMLOG_DATA_ROOT=/path/to/Data\n"
+            "  - or a config file: cp beamlog.example.json beamlog.json  (then edit)",
+            file=sys.stderr,
+        )
+        return None
+    return path
 
 # A SPEC prompt line, e.g. "3016.PSIC6IDB> ca 0 0 2"
 PROMPT_RE = re.compile(r"^\d+\.[A-Za-z0-9_]+>\s?(.*)$")
@@ -247,17 +351,22 @@ def cmd_log(args):
 
 
 def cmd_ingest(args):
+    logfile = _need_logfile(args.logfile)
+    if logfile is None:
+        return 1
     with connect() as conn:
         exp = resolve_experiment(conn, args.exp)
         if exp is None:
             return 1
-        n = ingest_file(conn, os.path.abspath(args.logfile), exp, follow_tail=False)
+        n = ingest_file(conn, logfile, exp, follow_tail=False)
     print(f"ingested {n} new action(s) into experiment {exp}")
     return 0
 
 
 def cmd_tail(args):
-    logfile = os.path.abspath(args.logfile)
+    logfile = _need_logfile(args.logfile)
+    if logfile is None:
+        return 1
     with connect() as conn:
         exp = resolve_experiment(conn, args.exp)
         if exp is None:
@@ -351,6 +460,18 @@ def cmd_experiments(args):
     return 0
 
 
+def cmd_resolve(args):
+    """Show which paths the tool resolved, and how -- a quick sanity check."""
+    logfile, how = resolve_logfile(args.logfile)
+    print(f"db:       {DB_PATH}")
+    print(f"data_root:{resolve_data_root() or ' (unset)'}")
+    if logfile:
+        print(f"spec log: {logfile}   [{how}]")
+    else:
+        print("spec log: (none configured -- run `tail`/`ingest` for guidance)")
+    return 0
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(
         prog="bl", description=__doc__,
@@ -366,15 +487,19 @@ def main(argv=None):
     pe.set_defaults(func=cmd_experiment)
 
     pt = sub.add_parser("tail", help="follow a SPEC log file live")
-    pt.add_argument("logfile")
+    pt.add_argument("logfile", nargs="?", help="path (default: resolved from config/env)")
     pt.add_argument("--exp", type=int, help="experiment id (default: most recent)")
     pt.add_argument("--interval", type=float, default=1.0, help="poll seconds (default 1)")
     pt.set_defaults(func=cmd_tail)
 
     pi = sub.add_parser("ingest", help="one-shot import of an existing SPEC log")
-    pi.add_argument("logfile")
+    pi.add_argument("logfile", nargs="?", help="path (default: resolved from config/env)")
     pi.add_argument("--exp", type=int, help="experiment id (default: most recent)")
     pi.set_defaults(func=cmd_ingest)
+
+    prs = sub.add_parser("resolve", help="show resolved db + log paths and exit")
+    prs.add_argument("logfile", nargs="?", help="optional path to test resolution")
+    prs.set_defaults(func=cmd_resolve)
 
     pl = sub.add_parser("log", help="manually log a single action")
     pl.add_argument("command", nargs=argparse.REMAINDER, help="e.g. ascan tth 20 40 100 1")
