@@ -179,7 +179,8 @@ CREATE TABLE IF NOT EXISTS actions (
     command       TEXT NOT NULL,
     output        TEXT,                                -- raw SPEC response (auto)
     reasoning     TEXT,                                -- WHY (human/agent)
-    observation   TEXT                                 -- what was learned (human/agent)
+    observation   TEXT,                                -- what was learned (human/agent)
+    reviewed_at   TEXT                                 -- queue marker: set when annotated OR skipped
 );
 CREATE INDEX IF NOT EXISTS idx_actions_experiment ON actions(experiment_id, id);
 
@@ -201,7 +202,16 @@ def connect() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Tiny forward migrations so existing DBs gain new columns."""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(actions)")}
+    if "reviewed_at" not in cols:
+        conn.execute("ALTER TABLE actions ADD COLUMN reviewed_at TEXT")
+        conn.commit()
 
 
 def latest_experiment_id(conn: sqlite3.Connection) -> int | None:
@@ -403,6 +413,7 @@ def cmd_note(args):
             sets.append("reasoning=?"); vals.append(args.why)
         if args.obs is not None:
             sets.append("observation=?"); vals.append(args.obs)
+        sets.append("reviewed_at=?"); vals.append(now_iso())  # leaves the review queue
         vals.append(target)
         n = conn.execute(f"UPDATE actions SET {', '.join(sets)} WHERE id=?", vals).rowcount
     if n == 0:
@@ -472,6 +483,13 @@ def cmd_resolve(args):
     return 0
 
 
+def cmd_gui(args):
+    """Launch the browser-based review-queue annotator (stdlib http.server)."""
+    import beamlog_gui  # lazy import to avoid a load-time cycle
+    return beamlog_gui.serve(exp=args.exp, host=args.host, port=args.port,
+                             open_browser=not args.no_browser)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(
         prog="bl", description=__doc__,
@@ -500,6 +518,13 @@ def main(argv=None):
     prs = sub.add_parser("resolve", help="show resolved db + log paths and exit")
     prs.add_argument("logfile", nargs="?", help="optional path to test resolution")
     prs.set_defaults(func=cmd_resolve)
+
+    pg = sub.add_parser("gui", help="browser review-queue annotator")
+    pg.add_argument("--exp", type=int, help="experiment id (default: most recent)")
+    pg.add_argument("--host", default="127.0.0.1", help="bind host (default localhost)")
+    pg.add_argument("--port", type=int, default=8765, help="port (default 8765)")
+    pg.add_argument("--no-browser", action="store_true", help="don't auto-open a browser")
+    pg.set_defaults(func=cmd_gui)
 
     pl = sub.add_parser("log", help="manually log a single action")
     pl.add_argument("command", nargs=argparse.REMAINDER, help="e.g. ascan tth 20 40 100 1")
