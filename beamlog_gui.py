@@ -33,8 +33,10 @@ def _experiment(conn, exp):
     return conn.execute("SELECT * FROM experiments WHERE id=?", (exp,)).fetchone()
 
 
+QUEUE_CAP = 200  # most un-reviewed rows sent to the page at once
+
 def queue_state(exp):
-    """Return the next un-reviewed action + counts for an experiment."""
+    """Return the un-reviewed backlog (oldest first) + recently reviewed."""
     with beamlog.connect() as conn:
         row = _experiment(conn, exp)
         if row is None:
@@ -44,16 +46,16 @@ def queue_state(exp):
             "SELECT COUNT(*) c FROM actions WHERE experiment_id=? AND reviewed_at IS NULL",
             (eid,),
         ).fetchone()["c"]
-        nxt = conn.execute(
+        items = conn.execute(
             """SELECT id, created_at, command, output, reasoning, observation
                FROM actions WHERE experiment_id=? AND reviewed_at IS NULL
-               ORDER BY id ASC LIMIT 1""",
-            (eid,),
-        ).fetchone()
+               ORDER BY id ASC LIMIT ?""",
+            (eid, QUEUE_CAP),
+        ).fetchall()
         recent = conn.execute(
             """SELECT id, command, reasoning, observation
                FROM actions WHERE experiment_id=? AND reviewed_at IS NOT NULL
-               ORDER BY reviewed_at DESC, id DESC LIMIT 5""",
+               ORDER BY reviewed_at DESC, id DESC LIMIT 8""",
             (eid,),
         ).fetchall()
     return {
@@ -62,7 +64,7 @@ def queue_state(exp):
             "technique": row["technique"], "goal": row["goal"],
         },
         "remaining": remaining,
-        "item": dict(nxt) if nxt else None,
+        "items": [dict(r) for r in items],
         "recent": [dict(r) for r in recent],
     }
 
@@ -143,125 +145,160 @@ class Handler(BaseHTTPRequestHandler):
 PAGE = r"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>beamlog review</title>
+<title>beamlog</title>
 <style>
-  :root { color-scheme: light dark; }
-  * { box-sizing: border-box; }
-  body { font: 15px/1.5 system-ui, sans-serif; margin: 0; background: #0f1115; color: #e6e6e6; }
-  .wrap { max-width: 760px; margin: 0 auto; padding: 18px; }
-  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
-  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
-  header .meta { color: #9aa4b2; font-size: 13px; }
-  .badge { margin-left: auto; background: #1f6feb; color: #fff; border-radius: 999px;
-           padding: 2px 11px; font-size: 13px; font-weight: 600; }
-  .badge.done { background: #2ea043; }
-  .card { background: #171a21; border: 1px solid #262b36; border-radius: 12px; padding: 16px; }
-  .cmd { font-family: ui-monospace, monospace; font-size: 16px; color: #7ee787;
-         background: #0c0e13; border-radius: 8px; padding: 10px 12px; word-break: break-all; }
-  .when { color: #6e7681; font-size: 12px; margin: 6px 2px 0; }
-  details.out { margin-top: 10px; }
-  details.out summary { cursor: pointer; color: #9aa4b2; font-size: 13px; }
-  pre.out { font-family: ui-monospace, monospace; font-size: 12px; color: #b8c0cc;
-            background: #0c0e13; border-radius: 8px; padding: 10px; margin: 8px 0 0;
-            max-height: 220px; overflow: auto; white-space: pre-wrap; }
-  label { display: block; margin: 14px 2px 5px; font-size: 13px; color: #9aa4b2; }
-  textarea { width: 100%; background: #0c0e13; color: #e6e6e6; border: 1px solid #2a3140;
-             border-radius: 8px; padding: 9px 11px; font: inherit; resize: vertical; min-height: 46px; }
-  textarea:focus { outline: none; border-color: #1f6feb; }
-  .row { display: flex; gap: 10px; margin-top: 14px; align-items: center; }
-  button { font: inherit; border: 0; border-radius: 8px; padding: 9px 16px; cursor: pointer; }
-  .save { background: #1f6feb; color: #fff; font-weight: 600; }
-  .skip { background: #21262d; color: #c9d1d9; }
-  .hint { color: #6e7681; font-size: 12px; margin-left: auto; }
-  .empty { text-align: center; color: #9aa4b2; padding: 40px 0; }
-  .recent { margin-top: 22px; }
-  .recent h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: #6e7681; }
-  .recent .r { border-top: 1px solid #20252f; padding: 8px 2px; font-size: 13px; }
-  .recent .rc { font-family: ui-monospace, monospace; color: #9aa4b2; }
-  .recent .rt { color: #768; }
-  kbd { background: #21262d; border: 1px solid #30363d; border-bottom-width: 2px;
-        border-radius: 5px; padding: 0 5px; font-size: 11px; font-family: ui-monospace, monospace; }
+  body { font: 13px/1.45 -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; color: #111; background: #fff; }
+  .wrap { max-width: 920px; margin: 0 auto; padding: 10px 14px 40px; }
+  header { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+           border-bottom: 1px solid #ddd; padding-bottom: 7px; position: sticky; top: 0; background: #fff; }
+  h1 { font-size: 13px; margin: 0; font-weight: 700; }
+  .meta { color: #666; }
+  .count { margin-left: auto; font-weight: 700; }
+  .hint { color: #999; font-size: 11px; width: 100%; margin-top: 2px; }
+  kbd { font-family: ui-monospace, monospace; background: #f1f1f1; border: 1px solid #ccc;
+        border-radius: 3px; padding: 0 4px; font-size: 10px; }
+  .row { border: 1px solid #ddd; border-radius: 4px; padding: 6px 8px; margin-top: 6px; }
+  .row.new { border-color: #6aa3e0; }
+  .head { display: flex; align-items: baseline; gap: 6px; }
+  .id { color: #999; }
+  .cmd { font-family: ui-monospace, Menlo, Consolas, monospace; word-break: break-all; }
+  .tog { color: #06c; cursor: pointer; font-size: 11px; user-select: none; }
+  .when { color: #bbb; font-size: 11px; margin-left: auto; }
+  .fields { display: flex; gap: 6px; margin-top: 5px; }
+  .fields input { font: inherit; padding: 3px 6px; border: 1px solid #ccc; border-radius: 3px; }
+  .fields input.why { flex: 1.3; }
+  .fields input.obs { flex: 1; }
+  .fields input:focus { outline: none; border-color: #06c; }
+  button { font: inherit; padding: 3px 9px; border: 1px solid #bbb; background: #f6f6f6;
+           border-radius: 3px; cursor: pointer; }
+  button:hover { background: #ececec; }
+  pre.out { font-family: ui-monospace, monospace; font-size: 11px; color: #444; background: #f7f7f7;
+            border: 1px solid #eee; border-radius: 3px; padding: 6px; margin: 5px 0 0;
+            white-space: pre-wrap; max-height: 170px; overflow: auto; }
+  .empty { color: #888; padding: 22px; text-align: center; }
+  .reviewed { margin-top: 18px; border-top: 1px solid #ddd; padding-top: 7px; }
+  .reviewed h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .03em; color: #999; margin: 0 0 3px; }
+  .rev { font-size: 12px; color: #555; padding: 1px 0; }
+  .rev .rc { font-family: ui-monospace, monospace; color: #333; }
+  .rev .muted { color: #aaa; }
 </style></head>
 <body><div class="wrap">
   <header>
-    <h1>beamlog review</h1>
+    <h1>beamlog</h1>
     <span class="meta" id="meta"></span>
-    <span class="badge" id="badge">…</span>
+    <span class="count" id="count"></span>
+    <span class="hint"><kbd>Enter</kbd> save &amp; next row · <kbd>Esc</kbd> skip · click <b>output</b> to expand</span>
   </header>
-  <div id="main"></div>
-  <div class="recent" id="recent"></div>
+  <div id="backlog"></div>
+  <div class="reviewed" id="reviewed"></div>
 </div>
 <script>
-let cur = null;
+const known = new Set();          // ids currently shown in the backlog
+const backlog = document.getElementById('backlog');
 
-function esc(s){ return (s||"").replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function el(tag, cls, txt){ const e = document.createElement(tag); if(cls) e.className = cls; if(txt != null) e.textContent = txt; return e; }
 
-function render(state){
+function makeRow(it){
+  const row = el('div', 'row new'); row.dataset.id = it.id;
+  setTimeout(() => row.classList.remove('new'), 1500);
+
+  const head = el('div', 'head');
+  head.append(el('span', 'id', '#' + it.id), el('span', 'cmd', it.command));
+  let pre = null;
+  if(it.output){
+    pre = el('pre', 'out'); pre.hidden = true; pre.textContent = it.output;
+    const tog = el('span', 'tog', 'output');
+    tog.onclick = () => { pre.hidden = !pre.hidden; };
+    head.append(tog);
+  }
+  head.append(el('span', 'when', (it.created_at || '').replace('T', ' ')));
+  row.append(head);
+
+  const f = el('div', 'fields');
+  const why = el('input', 'why'); why.placeholder = 'why…'; if(it.reasoning) why.value = it.reasoning;
+  const obs = el('input', 'obs'); obs.placeholder = 'observation…'; if(it.observation) obs.value = it.observation;
+  for(const inp of [why, obs]){
+    inp.addEventListener('keydown', ev => {
+      if(ev.key === 'Enter'){ ev.preventDefault(); doReview(it.id, false); }
+      else if(ev.key === 'Escape'){ ev.preventDefault(); doReview(it.id, true); }
+    });
+  }
+  const save = el('button', null, 'save'); save.onclick = () => doReview(it.id, false);
+  const skip = el('button', null, 'skip'); skip.onclick = () => doReview(it.id, true);
+  f.append(why, obs, save, skip);
+  row.append(f);
+  if(pre) row.append(pre);
+  return row;
+}
+
+async function doReview(id, skip){
+  const row = backlog.querySelector('.row[data-id="' + id + '"]');
+  if(!row) return;
+  const why = row.querySelector('.why').value;
+  const obs = row.querySelector('.obs').value;
+  const next = row.nextElementSibling;
+  const state = await (await fetch('/api/review', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({id, reasoning: skip ? '' : why, observation: skip ? '' : obs, skip})
+  })).json();
+  known.delete(id);
+  row.remove();
+  updateCount(state); updateReviewed(state); showEmpty();
+  const focus = (next && next.classList.contains('row')) ? next : backlog.querySelector('.row');
+  if(focus) focus.querySelector('.why').focus();
+}
+
+function updateCount(s){
+  const c = document.getElementById('count');
+  if(!s.experiment){ c.textContent = ''; return; }
+  let t = s.remaining + ' to review';
+  if(s.remaining > (s.items ? s.items.length : 0)) t += ' (showing ' + s.items.length + ')';
+  c.textContent = s.remaining ? t : 'all caught up';
+}
+
+function updateReviewed(s){
+  const r = document.getElementById('reviewed');
+  const list = s.recent || [];
+  r.innerHTML = list.length ? '<h2>recently reviewed</h2>' + list.map(x =>
+    '<div class="rev"><span class="rc">#' + x.id + ' ' + escHtml(x.command) + '</span>' +
+    (x.reasoning ? ' — ' + escHtml(x.reasoning) : ' <span class="muted">(skipped)</span>') + '</div>'
+  ).join('') : '';
+}
+
+function escHtml(s){ const d = el('span'); d.textContent = s || ''; return d.innerHTML; }
+
+function showEmpty(){
+  const has = backlog.querySelector('.row');
+  let e = document.getElementById('emptymsg');
+  if(has){ if(e) e.remove(); return; }
+  if(!e){ e = el('div', 'empty'); e.id = 'emptymsg'; e.textContent = 'Nothing to review — new commands appear here automatically.'; backlog.append(e); }
+}
+
+function apply(state, full){
   const meta = document.getElementById('meta');
-  const badge = document.getElementById('badge');
-  const main = document.getElementById('main');
-  const recent = document.getElementById('recent');
-
   if(!state.experiment){
-    meta.textContent=""; badge.textContent="—";
-    main.innerHTML = '<div class="card empty">No experiment yet. Create one with <code>bl experiment …</code>.</div>';
-    recent.innerHTML=""; cur=null; return;
+    meta.textContent = ''; updateCount(state); backlog.innerHTML = ''; known.clear();
+    backlog.innerHTML = '<div class="empty">No experiment yet — create one with <code>bl experiment …</code></div>';
+    updateReviewed(state); return;
   }
   const e = state.experiment;
-  meta.textContent = [e.user, e.material, e.technique, e.goal ? "· " + e.goal : ""].filter(Boolean).join("  ·  ");
-
-  const it = state.item;
-  cur = it;
-  if(!it){
-    badge.textContent = "all caught up"; badge.className = "badge done";
-    main.innerHTML = '<div class="card empty">✓ Nothing to review. New actions will appear here automatically.</div>';
-  } else {
-    badge.textContent = state.remaining + " to review"; badge.className = "badge";
-    main.innerHTML = `
-      <div class="card">
-        <div class="cmd">#${it.id}&nbsp; ${esc(it.command)}</div>
-        <div class="when">${esc(it.created_at)}</div>
-        ${it.output ? `<details class="out"><summary>SPEC output</summary><pre class="out">${esc(it.output)}</pre></details>` : ``}
-        <label>Why (reasoning)</label>
-        <textarea id="why" placeholder="why this command…">${esc(it.reasoning)}</textarea>
-        <label>Observation (what happened / what you learned)</label>
-        <textarea id="obs" placeholder="optional…">${esc(it.observation)}</textarea>
-        <div class="row">
-          <button class="save" onclick="save()">Save &amp; next</button>
-          <button class="skip" onclick="skip()">Skip</button>
-          <span class="hint"><kbd>Enter</kbd> save · <kbd>Shift</kbd>+<kbd>Enter</kbd> newline · <kbd>Esc</kbd> skip</span>
-        </div>
-      </div>`;
-    const why = document.getElementById('why');
-    why.focus();
-    for(const el of [why, document.getElementById('obs')]){
-      el.addEventListener('keydown', ev => {
-        if(ev.key === 'Enter' && !ev.shiftKey){ ev.preventDefault(); save(); }
-        else if(ev.key === 'Escape'){ ev.preventDefault(); skip(); }
-      });
-    }
+  meta.textContent = [e.user, e.material, e.technique, e.goal && ('· ' + e.goal)].filter(Boolean).join('  ·  ');
+  updateCount(state); updateReviewed(state);
+  if(full){ backlog.innerHTML = ''; known.clear(); }
+  for(const it of (state.items || [])){
+    if(!known.has(it.id)){ known.add(it.id); backlog.append(makeRow(it)); }
   }
-
-  recent.innerHTML = state.recent && state.recent.length ? '<h2>recently reviewed</h2>' +
-    state.recent.map(r => `<div class="r"><span class="rc">#${r.id} ${esc(r.command)}</span>` +
-      (r.reasoning ? ` — ${esc(r.reasoning)}` : ' — <span class="rt">(skipped)</span>') + `</div>`).join('') : '';
+  showEmpty();
 }
 
-async function load(){ render(await (await fetch('/api/queue')).json()); }
+async function poll(){ try { apply(await (await fetch('/api/queue')).json(), false); } catch(e){} }
 
-async function post(skip){
-  if(!cur) return;
-  const why = document.getElementById('why'), obs = document.getElementById('obs');
-  const r = await fetch('/api/review', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({id: cur.id, reasoning: why?why.value:"", observation: obs?obs.value:"", skip})});
-  render(await r.json());
-}
-function save(){ post(false); }
-function skip(){ post(true); }
-
-// poll for new actions when the queue is empty (tail keeps adding them)
-setInterval(() => { if(!cur) load(); }, 3000);
-load();
+(async () => {
+  apply(await (await fetch('/api/queue')).json(), true);
+  const first = backlog.querySelector('.row');
+  if(first) first.querySelector('.why').focus();
+  setInterval(poll, 3000);   // pick up newly-tailed actions without disturbing in-progress rows
+})();
 </script>
 </body></html>
 """
