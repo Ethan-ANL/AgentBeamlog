@@ -162,6 +162,13 @@ SPEC_DATE_RE = re.compile(
     r"#C\s+([A-Z][a-z]{2}\s+[A-Z][a-z]{2}\s+\d+\s+\d{2}:\d{2}:\d{2}\s+\d{4})\."
 )
 
+# A bare timestamp line SPEC writes when a command returns, e.g.
+# "Fri Jun 26 10:57:21 2026" (same date format as above, no "#C", no period)
+# if enabled in config, it is the last line of the output block
+BARE_DATE_RE = re.compile(
+    r"^([A-Z][a-z]{2}\s+[A-Z][a-z]{2}\s+\d+\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s*$"
+)
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS experiments (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -195,6 +202,16 @@ CREATE TABLE IF NOT EXISTS ingest_state (
 
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+def _parse_spec_date(s: str) -> str | None:
+    """Parse a SPEC date like 'Fri Jun 26 10:57:21 2026' to ISO, or None."""
+    try:
+        return datetime.strptime(
+            " ".join(s.split()), "%a %b %d %H:%M:%S %Y"
+        ).isoformat(timespec="seconds")
+    except ValueError:
+        return None
 
 
 def connect() -> sqlite3.Connection:
@@ -239,9 +256,12 @@ def resolve_experiment(conn: sqlite3.Connection, explicit: int | None) -> int | 
 def parse_blocks(text: str) -> list[dict]:
     """Split a SPEC transcript into one block per prompt line.
 
-    Returns a list of dicts: {command, output, ts}. Blocks with an empty
-    command (a bare Enter at the prompt) are dropped. `ts` is taken from a
-    "#C <date>." line inside the output when present, else None.
+    Returns a list of dicts: {command, output, ts, complete}. Blocks with an
+    empty command (a bare Enter at the prompt) are dropped. `ts` is taken from a
+    trailing bare-timestamp line (SPEC's command-completion stamp) when present,
+    else a "#C <date>." comment, else None. `complete` is True when a trailing
+    timestamp was found -- i.e. the command has finished -- which lets live
+    `tail` store the last block without waiting for the next prompt.
     """
     lines = text.splitlines()
     prompts: list[tuple[int, str]] = []  # (line index, command)
@@ -259,17 +279,32 @@ def parse_blocks(text: str) -> list[dict]:
             out_lines.pop(0)
         while out_lines and not out_lines[-1].strip():
             out_lines.pop()
-        output = "\n".join(out_lines)
+
+        # A bare timestamp as the final line is SPEC's command-completion stamp:
+        # it is logged when the command returns, *before* the next prompt. Use it
+        # as the action time, drop it from the stored output, and flag the block
+        # complete so live `tail` can store it without waiting for the next
+        # prompt. Not every SPEC config emits it -- when absent we fall back to a
+        # "#C <date>." comment for the time, and the block stays "incomplete".
         ts = None
-        dm = SPEC_DATE_RE.search(output)
-        if dm:
-            try:
-                ts = datetime.strptime(dm.group(1), "%a %b %d %H:%M:%S %Y").isoformat(
-                    timespec="seconds"
-                )
-            except ValueError:
-                ts = None
-        blocks.append({"command": command, "output": output, "ts": ts})
+        complete = False
+        if out_lines:
+            bm = BARE_DATE_RE.match(out_lines[-1])
+            if bm:
+                ts = _parse_spec_date(bm.group(1))
+                complete = True
+                out_lines.pop()
+                while out_lines and not out_lines[-1].strip():
+                    out_lines.pop()
+
+        output = "\n".join(out_lines)
+        if ts is None:
+            dm = SPEC_DATE_RE.search(output)
+            if dm:
+                ts = _parse_spec_date(dm.group(1))
+        blocks.append(
+            {"command": command, "output": output, "ts": ts, "complete": complete}
+        )
     return blocks
 
 
@@ -294,16 +329,18 @@ def insert_actions(conn, exp_id, blocks):
 def ingest_file(conn, logfile, exp_id, follow_tail=False):
     """Parse `logfile` and insert any new complete command blocks.
 
-    When `follow_tail` is True the final block is held back (its output may
-    still be growing), so only blocks terminated by a later prompt are stored.
+    When `follow_tail` is True the final block is held back only while it looks
+    unfinished -- i.e. it carries no completion timestamp yet -- so a command
+    that has logged its closing stamp is stored at once, without waiting for the
+    next prompt. Configs that don't emit the stamp fall back to that wait.
     Resumes via ingest_state.prompts_consumed. Returns number of rows inserted.
     """
     with open(logfile, "r", errors="replace") as f:
         text = f.read()
     blocks = parse_blocks(text)
     total = len(blocks)
-    if follow_tail and total:
-        total -= 1  # hold the last (possibly-incomplete) block
+    if follow_tail and total and not blocks[-1]["complete"]:
+        total -= 1  # last command may still be running (no completion stamp yet)
 
     row = conn.execute(
         "SELECT prompts_consumed FROM ingest_state WHERE logfile=?", (logfile,)
