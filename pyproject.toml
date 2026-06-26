@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "AgentBeamlog"
+version = "0.1.0"
+description = "Lightweight capture of beamline actions + reasoning/observation for agent fine-tuning"
+requires-python = ">=3.9"
+dependencies = []                      # stdlib only
+
+[project.scripts]
+bl = "beamlog:main"
+
+[tool.setuptools]
+py-modules = ["beamlog", "beamlog_gui"]

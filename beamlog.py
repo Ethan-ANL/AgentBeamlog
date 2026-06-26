@@ -7,7 +7,7 @@ One SQLite file, stdlib only. Two tables:
   actions(id, experiment_id -> experiments.id, created_at,
           command, output, reasoning, observation)
 
-The scientist uses SPEC normally. SPEC already writes a session transcript
+User uses SPEC normally. SPEC already writes a session transcript
 (the log file in its logs/ dir) recording every command + its output. We read
 that file -- no wrapper, no macro, no change to how they work.
 
