@@ -86,6 +86,18 @@ _PVTYPE_DTYPE = {
 _BYTES_DTYPE = {1: "uint8", 2: "uint16", 4: "uint32", 8: "uint64"}
 
 
+def _union_to_dict(x):
+    """Normalize a pvapy union field to a {memberName: value} dict.
+
+    pvapy returns a *regular union* (like NTNDArray's `value`, or codec
+    `parameters`) as a one-element list wrapping that dict -- e.g.
+    [{'ubyteValue': arr}] -- and occasionally as the dict directly. Either way
+    return the inner dict ({} if there's nothing in it)."""
+    if isinstance(x, (list, tuple)):
+        x = x[0] if x else {}
+    return dict(x) if isinstance(x, dict) else {}
+
+
 def _codec_param_code(pv):
     """Original pixel type code from NTNDArray codec.parameters, or None.
 
@@ -95,12 +107,13 @@ def _codec_param_code(pv):
         params = pv["codec"]["parameters"]
     except Exception:                              # noqa: BLE001 - field absent
         return None
-    try:
-        if isinstance(params, dict):               # a union -> first active member
-            for v in params.values():
-                if v is not None:
-                    return int(v)
-            return None
+    for v in _union_to_dict(params).values():      # union form: {memberName: code}
+        if v is not None:
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return None
+    try:                                           # or a bare scalar
         return int(params)
     except (TypeError, ValueError):
         return None
@@ -239,9 +252,10 @@ def _capture_pva(pv_name: str, *, timeout: float = 1.0) -> dict:
     if len(dims) not in (2, 3):
         raise FrameError(f"unsupported dimensionality ({len(dims)} dims)")
 
-    # active member of the `value` union -> raw buffer (compressed if codec set)
+    # active member of the `value` union -> raw buffer (compressed if codec set).
+    # pvapy hands back the union as [{'ubyteValue': arr}], so normalize it.
     try:
-        value = dict(pv["value"])
+        value = _union_to_dict(pv["value"])
     except Exception as e:                         # noqa: BLE001
         raise FrameError(f"no value field: {e}")
     member = next((k for k, v in value.items() if v is not None), None)
