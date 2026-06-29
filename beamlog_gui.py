@@ -35,6 +35,24 @@ def _experiment(conn, exp):
 
 QUEUE_CAP = 200  # most un-reviewed rows sent to the page at once
 
+
+def _frame_info(conn, action_id):
+    """Per-action frame summary for the queue (None if no frame row). Exposes
+    only id-keyed metadata -- never a filesystem path (path-traversal safety)."""
+    r = conn.execute(
+        "SELECT width, height, kept, error, png_path FROM frames WHERE action_id=?",
+        (action_id,),
+    ).fetchone()
+    if r is None:
+        return None
+    return {
+        "present": bool(r["png_path"]),   # a viewable thumbnail exists
+        "width": r["width"], "height": r["height"],
+        "kept": bool(r["kept"]),
+        "error": r["error"],
+    }
+
+
 def queue_state(exp):
     """Return the un-reviewed backlog (oldest first) + recently reviewed."""
     with beamlog.connect() as conn:
@@ -58,19 +76,43 @@ def queue_state(exp):
                ORDER BY reviewed_at DESC, id DESC LIMIT 8""",
             (eid,),
         ).fetchall()
+        item_dicts = []
+        for r in items:
+            d = dict(r)
+            d["frame"] = _frame_info(conn, r["id"])
+            item_dicts.append(d)
     return {
         "experiment": {
             "id": row["id"], "user": row["user"], "material": row["material"],
             "technique": row["technique"], "goal": row["goal"],
         },
         "remaining": remaining,
-        "items": [dict(r) for r in items],
+        "items": item_dicts,
         "recent": [dict(r) for r in recent],
     }
 
 
-def review(action_id, reasoning, observation, skip):
-    """Mark an action reviewed; write text unless skipping. Returns rowcount."""
+def frame_png(action_id):
+    """Return (bytes, None) for the cached thumbnail of `action_id`, or
+    (None, reason). Looks the path up server-side by row id -- the client never
+    supplies a path."""
+    with beamlog.connect() as conn:
+        r = conn.execute(
+            "SELECT png_path FROM frames WHERE action_id=?", (action_id,)
+        ).fetchone()
+    if r is None or not r["png_path"]:
+        return None, "no frame"
+    try:
+        with open(r["png_path"], "rb") as f:
+            return f.read(), None
+    except OSError as e:
+        return None, str(e)
+
+
+def review(action_id, reasoning, observation, skip, keep_frame=False):
+    """Mark an action reviewed; write text unless skipping. Also decide the
+    action's cached frame: keep_frame True -> retain (kept=1); otherwise discard
+    -- delete both cached files. Default is discard. Returns rowcount."""
     with beamlog.connect() as conn:
         if skip:
             n = conn.execute(
@@ -82,7 +124,29 @@ def review(action_id, reasoning, observation, skip):
                 "UPDATE actions SET reasoning=?, observation=?, reviewed_at=? WHERE id=?",
                 (reasoning or None, observation or None, beamlog.now_iso(), action_id),
             ).rowcount
+        _decide_frame(conn, action_id, keep_frame)
     return n
+
+
+def _decide_frame(conn, action_id, keep_frame):
+    """Apply the keep/discard decision to a pending frame (no-op if none)."""
+    r = conn.execute(
+        "SELECT id, npy_path, png_path FROM frames WHERE action_id=?", (action_id,)
+    ).fetchone()
+    if r is None:
+        return
+    if keep_frame:
+        conn.execute(
+            "UPDATE frames SET kept=1, decided_at=? WHERE id=?",
+            (beamlog.now_iso(), r["id"]),
+        )
+    else:
+        import beamlog_frames  # lazy; only needed to unlink files
+        beamlog_frames.discard(r["npy_path"], r["png_path"])
+        conn.execute(
+            "UPDATE frames SET kept=0, decided_at=?, npy_path=NULL, png_path=NULL WHERE id=?",
+            (beamlog.now_iso(), r["id"]),
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -111,6 +175,18 @@ class Handler(BaseHTTPRequestHandler):
             qs = parse_qs(urlparse(self.path).query)
             exp = int(qs["exp"][0]) if "exp" in qs else self.exp
             self._send(200, json.dumps(queue_state(exp)))
+        elif path == "/api/frame":
+            qs = parse_qs(urlparse(self.path).query)
+            try:
+                action_id = int(qs["id"][0])
+            except (KeyError, ValueError, IndexError):
+                self._send(400, json.dumps({"error": "bad id"}))
+                return
+            png, err = frame_png(action_id)
+            if png is None:
+                self._send(404, json.dumps({"error": err}))
+            else:
+                self._send(200, png, "image/png")
         else:
             self._send(404, json.dumps({"error": "not found"}))
 
@@ -130,6 +206,7 @@ class Handler(BaseHTTPRequestHandler):
                 (body.get("reasoning") or "").strip(),
                 (body.get("observation") or "").strip(),
                 bool(body.get("skip")),
+                bool(body.get("keep_frame")),
             )
         except (KeyError, ValueError, TypeError):
             self._send(400, json.dumps({"error": "bad request"}))
@@ -175,6 +252,13 @@ PAGE = r"""<!doctype html>
   pre.out { font-family: ui-monospace, monospace; font-size: 11px; color: #444; background: #f7f7f7;
             border: 1px solid #eee; border-radius: 3px; padding: 6px; margin: 5px 0 0;
             white-space: pre-wrap; max-height: 170px; overflow: auto; }
+  .frame { display: flex; align-items: center; gap: 8px; margin-top: 5px; }
+  .frame img { max-height: 80px; max-width: 120px; border: 1px solid #ddd; border-radius: 3px;
+               cursor: zoom-in; background: #f7f7f7; }
+  .frame img.big { max-height: 420px; max-width: 100%; cursor: zoom-out; }
+  .frame label { display: flex; align-items: center; gap: 4px; cursor: pointer; user-select: none; }
+  .frame .fmeta { color: #999; font-size: 11px; }
+  .frame .ferr { color: #b00; font-size: 11px; }
   .empty { color: #888; padding: 22px; text-align: center; }
   .reviewed { margin-top: 18px; border-top: 1px solid #ddd; padding-top: 7px; }
   .reviewed h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .03em; color: #999; margin: 0 0 3px; }
@@ -228,6 +312,23 @@ function makeRow(it){
   f.append(why, obs, save, skip);
   row.append(f);
   if(pre) row.append(pre);
+
+  // detector frame (optional): thumbnail + a "keep frame" checkbox, default off.
+  if(it.frame){
+    const fr = el('div', 'frame');
+    if(it.frame.error){
+      fr.append(el('span', 'ferr', 'frame: ' + it.frame.error));
+    } else if(it.frame.present){
+      const img = el('img'); img.src = '/api/frame?id=' + it.id; img.alt = 'detector frame';
+      img.onclick = () => img.classList.toggle('big');
+      const keep = el('input'); keep.type = 'checkbox'; keep.className = 'keepframe';
+      const lab = el('label'); lab.append(keep, el('span', null, 'keep frame'));
+      const dims = (it.frame.width ? it.frame.width + '×' + it.frame.height : '');
+      fr.append(img, lab);
+      if(dims) fr.append(el('span', 'fmeta', dims));
+    }
+    if(fr.childNodes.length) row.append(fr);
+  }
   return row;
 }
 
@@ -236,10 +337,12 @@ async function doReview(id, skip){
   if(!row) return;
   const why = row.querySelector('.why').value;
   const obs = row.querySelector('.obs').value;
+  const keepEl = row.querySelector('.keepframe');
+  const keep_frame = keepEl ? keepEl.checked : false;   // default discard
   const next = row.nextElementSibling;
   const state = await (await fetch('/api/review', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({id, reasoning: skip ? '' : why, observation: skip ? '' : obs, skip})
+    body: JSON.stringify({id, reasoning: skip ? '' : why, observation: skip ? '' : obs, skip, keep_frame})
   })).json();
   known.delete(id);
   row.remove();

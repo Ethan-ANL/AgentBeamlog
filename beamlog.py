@@ -49,7 +49,7 @@ import re
 import sqlite3
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # --------------------------------------------------------------------------- #
 # configuration -- nothing about any site's directory layout is baked into the
@@ -103,6 +103,43 @@ def resolve_db() -> str:
     if root:
         return os.path.join(root, "beamlog.db")
     return os.path.join(os.getcwd(), "beamlog.db")
+
+
+# --------------------------------------------------------------------------- #
+# optional area-detector frame capture (off unless `frame_pv` is configured).
+# All of this is best-effort: nothing here ever gates command logging.
+# --------------------------------------------------------------------------- #
+
+def resolve_frame_pv():
+    """The areaDetector PVA channel to capture from (e.g. '13SIM1:Pva1:Image'),
+    or the literal 'synthetic' for testing. Unset -> frame capture is off."""
+    return _setting("frame_pv", "BEAMLOG_FRAME_PV")
+
+
+def resolve_frames_dir() -> str:
+    """Where cached frames live. Explicit setting wins; otherwise a
+    'beamlog_frames' dir beside the DB (i.e. in the Data folder, not the repo)."""
+    d = _setting("frames_dir", "BEAMLOG_FRAMES_DIR")
+    if d:
+        return os.path.expanduser(d)
+    return os.path.join(os.path.dirname(DB_PATH), "beamlog_frames")
+
+
+def resolve_frame_timeout() -> float:
+    return float(_setting("frame_timeout", "BEAMLOG_FRAME_TIMEOUT", 1.0))
+
+
+def resolve_frame_filter():
+    """Optional regex; only commands matching it are captured (default: all)."""
+    return _setting("frame_filter", "BEAMLOG_FRAME_FILTER")
+
+
+def resolve_frame_ttl_hours() -> float:
+    return float(_setting("frame_ttl_hours", "BEAMLOG_FRAME_TTL_HOURS", 48))
+
+
+def resolve_frame_cache_max_mb() -> float:
+    return float(_setting("frame_cache_max_mb", "BEAMLOG_FRAME_CACHE_MAX_MB", 2048))
 
 
 def resolve_logfile(arg: str | None = None):
@@ -197,6 +234,27 @@ CREATE TABLE IF NOT EXISTS ingest_state (
     prompts_consumed INTEGER NOT NULL,
     experiment_id    INTEGER
 );
+
+-- optional: one cached area-detector frame per action (see beamlog_frames.py).
+-- kept=0 / decided_at NULL means "pending" -- captured but not yet kept; the
+-- default outcome is discard. npy_path/png_path are NULL when capture failed
+-- (the reason is in `error`), which distinguishes "detector down" from
+-- "feature off" (no row at all).
+CREATE TABLE IF NOT EXISTS frames (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    action_id  INTEGER NOT NULL UNIQUE REFERENCES actions(id),
+    created_at TEXT NOT NULL,
+    pv         TEXT,
+    npy_path   TEXT,
+    png_path   TEXT,
+    width      INTEGER,
+    height     INTEGER,
+    dtype      TEXT,
+    unique_id  INTEGER,
+    kept       INTEGER NOT NULL DEFAULT 0,
+    decided_at TEXT,
+    error      TEXT
+);
 """
 
 
@@ -218,6 +276,10 @@ def connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # tail and gui both write now (actions + frames); WAL + a busy timeout keep
+    # concurrent writers from tripping over "database is locked".
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 3000")
     conn.executescript(SCHEMA)
     _migrate(conn)
     return conn
@@ -309,21 +371,28 @@ def parse_blocks(text: str) -> list[dict]:
 
 
 def insert_actions(conn, exp_id, blocks):
-    """Insert a list of parsed blocks (skipping empty commands). Returns count.
+    """Insert a list of parsed blocks (skipping empty commands).
+
+    Returns one dict per inserted row -- {id, command, ts, complete} -- so live
+    `tail` can decide whether to capture a detector frame for a just-completed
+    command. (Callers that only want a count use len() of the result.)
 
     created_at uses the SPEC "#C" timestamp when the block has one, otherwise
     the current time (accurate to the poll interval during live `tail`)."""
-    n = 0
+    inserted = []
     for b in blocks:
         if not b["command"]:
             continue
-        conn.execute(
+        cur = conn.execute(
             """INSERT INTO actions (experiment_id, created_at, command, output)
                VALUES (?,?,?,?)""",
             (exp_id, b["ts"] or now_iso(), b["command"], b["output"] or None),
         )
-        n += 1
-    return n
+        inserted.append({
+            "id": cur.lastrowid, "command": b["command"],
+            "ts": b["ts"], "complete": b["complete"],
+        })
+    return inserted
 
 
 def ingest_file(conn, logfile, exp_id, follow_tail=False):
@@ -333,30 +402,44 @@ def ingest_file(conn, logfile, exp_id, follow_tail=False):
     unfinished -- i.e. it carries no completion timestamp yet -- so a command
     that has logged its closing stamp is stored at once, without waiting for the
     next prompt. Configs that don't emit the stamp fall back to that wait.
-    Resumes via ingest_state.prompts_consumed. Returns number of rows inserted.
+    Resumes via ingest_state.prompts_consumed. Returns one dict per inserted
+    row ({id, command, ts, complete}); callers wanting a count use len().
     """
     with open(logfile, "r", errors="replace") as f:
         text = f.read()
     blocks = parse_blocks(text)
-    total = len(blocks)
-    if follow_tail and total and not blocks[-1]["complete"]:
-        total -= 1  # last command may still be running (no completion stamp yet)
+    n_prompts = len(blocks)        # every prompt line, finished or not -- stable
+    # How far we ingest this pass: everything, except a still-running final block
+    # (no completion stamp yet) which we hold back. A *completed* final block is
+    # stored at once -- that is the whole point of the stamp.
+    end = n_prompts
+    if follow_tail and n_prompts and not blocks[-1]["complete"]:
+        end -= 1
 
     row = conn.execute(
         "SELECT prompts_consumed FROM ingest_state WHERE logfile=?", (logfile,)
     ).fetchone()
     consumed = row["prompts_consumed"] if row else 0
-    if consumed > total:          # file rotated/truncated -> start over
+    # Rotation/truncation == fewer prompt lines than we have already consumed.
+    # Compare against the prompt COUNT, never against `end`: a completed final
+    # block that later gains trailing text (an async message, a "Scan stored in
+    # ..." summary) flips back to "incomplete" and lowers `end` below `consumed`
+    # -- that is not a rotation, and treating it as one re-ingested the whole
+    # file and duplicated every action on the next poll.
+    if consumed > n_prompts:
         consumed = 0
 
-    new_blocks = blocks[consumed:total]
+    new_blocks = blocks[consumed:end]
     inserted = insert_actions(conn, exp_id, new_blocks)
+    # The cursor is a high-water mark: once a block is stored it must never be
+    # re-ingested, so the held-back/flip case (end < consumed) leaves it put.
+    new_consumed = max(consumed, end)
     conn.execute(
         """INSERT INTO ingest_state (logfile, prompts_consumed, experiment_id)
            VALUES (?,?,?)
            ON CONFLICT(logfile) DO UPDATE SET prompts_consumed=excluded.prompts_consumed,
                                               experiment_id=excluded.experiment_id""",
-        (logfile, total, exp_id),
+        (logfile, new_consumed, exp_id),
     )
     conn.commit()
     return inserted
@@ -405,9 +488,98 @@ def cmd_ingest(args):
         exp = resolve_experiment(conn, args.exp)
         if exp is None:
             return 1
-        n = ingest_file(conn, logfile, exp, follow_tail=False)
-    print(f"ingested {n} new action(s) into experiment {exp}")
+        # historical import never captures frames -- the detector no longer
+        # shows what these past commands produced.
+        inserted = ingest_file(conn, logfile, exp, follow_tail=False)
+    print(f"ingested {len(inserted)} new action(s) into experiment {exp}")
     return 0
+
+
+# --------------------------------------------------------------------------- #
+# live frame capture (best-effort; orchestrated only from `tail`)
+# --------------------------------------------------------------------------- #
+
+def _capture_one_frame(conn, inserted, frame_pv, frames_dir, timeout, filt):
+    """Capture at most one detector frame for this poll, for the most-recently
+    completed newly-inserted command. Best-effort: any failure is recorded in
+    the frames row's `error` column and never raises. Returns a status string
+    for the tail log, or None if nothing was attempted."""
+    import beamlog_frames  # lazy: keeps the optional dep off the import path
+
+    # only fully completed commands -- pick the newest one this poll.
+    done = [b for b in inserted if b.get("complete")]
+    if not done:
+        return None
+    block = done[-1]
+    if filt is not None and not filt.search(block["command"]):
+        return None  # command doesn't match the capture filter
+
+    action_id = block["id"]
+    try:
+        cap = beamlog_frames.capture(frame_pv, timeout=timeout)
+        npy_path, png_path = beamlog_frames.save_pending(frames_dir, action_id, cap)
+        conn.execute(
+            """INSERT OR REPLACE INTO frames
+               (action_id, created_at, pv, npy_path, png_path,
+                width, height, dtype, unique_id, kept, decided_at, error)
+               VALUES (?,?,?,?,?,?,?,?,?,0,NULL,NULL)""",
+            (action_id, now_iso(), cap.get("pv"), npy_path, png_path,
+             cap.get("width"), cap.get("height"), cap.get("dtype"),
+             cap.get("unique_id")),
+        )
+        conn.commit()
+        return f"frame for #{action_id} ({cap.get('width')}x{cap.get('height')})"
+    except beamlog_frames.FrameError as e:
+        conn.execute(
+            """INSERT OR REPLACE INTO frames
+               (action_id, created_at, pv, kept, decided_at, error)
+               VALUES (?,?,?,0,NULL,?)""",
+            (action_id, now_iso(), frame_pv, str(e)),
+        )
+        conn.commit()
+        return f"frame for #{action_id} failed: {e}"
+    except Exception as e:  # noqa: BLE001 - capture must never break ingestion
+        return f"frame for #{action_id} skipped: {e}"
+
+
+def _prune_frames(conn, frames_dir, ttl_hours, cache_max_mb):
+    """Discard *pending* (un-kept, undecided) frames so the cache can't fill a
+    disk: those whose action is already reviewed, those past the TTL, and -- if
+    still over budget -- the oldest first. Kept frames are never touched."""
+    import beamlog_frames
+
+    def _drop(rows):
+        for r in rows:
+            beamlog_frames.discard(r["npy_path"], r["png_path"])
+            conn.execute("DELETE FROM frames WHERE id=?", (r["id"],))
+
+    # 1) action already reviewed but frame never decided -> it'll never be kept
+    _drop(conn.execute(
+        """SELECT f.id, f.npy_path, f.png_path FROM frames f
+           JOIN actions a ON a.id = f.action_id
+           WHERE f.decided_at IS NULL AND a.reviewed_at IS NOT NULL"""
+    ).fetchall())
+
+    # 2) past the TTL
+    if ttl_hours > 0:
+        cutoff = (datetime.now() - timedelta(hours=ttl_hours)).isoformat(timespec="seconds")
+        _drop(conn.execute(
+            """SELECT id, npy_path, png_path FROM frames
+               WHERE decided_at IS NULL AND created_at < ?""", (cutoff,)
+        ).fetchall())
+
+    # 3) over the disk budget -> evict oldest pending first (FIFO)
+    if cache_max_mb > 0 and beamlog_frames.dir_size_bytes(frames_dir) > cache_max_mb * 1e6:
+        pending = conn.execute(
+            """SELECT id, npy_path, png_path FROM frames
+               WHERE decided_at IS NULL ORDER BY created_at ASC, id ASC"""
+        ).fetchall()
+        budget = cache_max_mb * 1e6
+        for r in pending:
+            if beamlog_frames.dir_size_bytes(frames_dir) <= budget:
+                break
+            _drop([r])
+    conn.commit()
 
 
 def cmd_tail(args):
@@ -418,14 +590,34 @@ def cmd_tail(args):
         exp = resolve_experiment(conn, args.exp)
         if exp is None:
             return 1
+
+    # resolve the (optional) frame-capture settings once, up front.
+    frame_pv = None if getattr(args, "no_frames", False) else resolve_frame_pv()
+    frames_dir = resolve_frames_dir()
+    frame_timeout = resolve_frame_timeout()
+    ttl_hours = resolve_frame_ttl_hours()
+    cache_max_mb = resolve_frame_cache_max_mb()
+    filt_pat = resolve_frame_filter()
+    filt = re.compile(filt_pat) if filt_pat else None
+
     print(f"tailing {logfile} -> experiment {exp} (Ctrl-C to stop)")
+    if frame_pv:
+        print(f"  frames: capturing from {frame_pv} -> {frames_dir}"
+              + (f"  filter={filt_pat!r}" if filt_pat else ""))
     try:
         while True:
             if os.path.exists(logfile):
                 with connect() as conn:
-                    n = ingest_file(conn, logfile, exp, follow_tail=True)
-                if n:
-                    print(f"  +{n} action(s) @ {now_iso()}")
+                    inserted = ingest_file(conn, logfile, exp, follow_tail=True)
+                    if inserted:
+                        print(f"  +{len(inserted)} action(s) @ {now_iso()}")
+                    if frame_pv and inserted:
+                        msg = _capture_one_frame(conn, inserted, frame_pv,
+                                                 frames_dir, frame_timeout, filt)
+                        if msg:
+                            print(f"  {msg}")
+                    if frame_pv:
+                        _prune_frames(conn, frames_dir, ttl_hours, cache_max_mb)
             time.sleep(args.interval)
     except KeyboardInterrupt:
         print("\nstopped.")
@@ -517,6 +709,57 @@ def cmd_resolve(args):
         print(f"spec log: {logfile}   [{how}]")
     else:
         print("spec log: (none configured -- run `tail`/`ingest` for guidance)")
+
+    # optional frame capture -- show what's configured and whether pvapy is here.
+    frame_pv = resolve_frame_pv()
+    if frame_pv:
+        import beamlog_frames  # lazy
+        print(f"frame pv: {frame_pv}")
+        print(f"frames:   {resolve_frames_dir()}  "
+              f"(timeout {resolve_frame_timeout()}s, ttl {resolve_frame_ttl_hours()}h, "
+              f"cap {resolve_frame_cache_max_mb():.0f}MB)")
+        filt = resolve_frame_filter()
+        print(f"  filter: {filt!r}" if filt else "  filter: (none -- all commands)")
+        if frame_pv == beamlog_frames.SYNTHETIC:
+            print("  pvapy:  not needed (synthetic test source)")
+        else:
+            print(f"  pvapy:  {'available' if beamlog_frames.pvapy_available() else 'NOT installed -- pip install .[frames]'}")
+    else:
+        print("frame pv: (unset -- frame capture off; set frame_pv to enable)")
+    return 0
+
+
+def cmd_frames(args):
+    """List cached frames, or garbage-collect pending ones (`bl frames gc`)."""
+    with connect() as conn:
+        if args.gc:
+            _prune_frames(conn, resolve_frames_dir(),
+                          resolve_frame_ttl_hours(), resolve_frame_cache_max_mb())
+            print("pruned pending frames")
+            return 0
+        rows = conn.execute(
+            """SELECT f.*, a.command FROM frames f
+               JOIN actions a ON a.id = f.action_id
+               ORDER BY f.id DESC LIMIT ?""",
+            (args.n,),
+        ).fetchall()
+    if args.json:
+        print(json.dumps([dict(r) for r in rows], indent=2))
+        return 0
+    if not rows:
+        print("no frames captured yet")
+        return 0
+    for r in reversed(rows):
+        if r["error"]:
+            state = f"ERROR: {r['error']}"
+        elif r["kept"]:
+            state = "kept"
+        elif r["decided_at"]:
+            state = "discarded"
+        else:
+            state = "pending"
+        dims = f"{r['width']}x{r['height']}" if r["width"] else "-"
+        print(f"#{r['action_id']:<4} [{state:<9}] {dims:>11}  {r['command']}")
     return 0
 
 
@@ -545,6 +788,8 @@ def main(argv=None):
     pt.add_argument("logfile", nargs="?", help="path (default: resolved from config/env)")
     pt.add_argument("--exp", type=int, help="experiment id (default: most recent)")
     pt.add_argument("--interval", type=float, default=1.0, help="poll seconds (default 1)")
+    pt.add_argument("--no-frames", action="store_true",
+                    help="disable detector-frame capture even if frame_pv is set")
     pt.set_defaults(func=cmd_tail)
 
     pi = sub.add_parser("ingest", help="one-shot import of an existing SPEC log")
@@ -574,6 +819,12 @@ def main(argv=None):
     pn.add_argument("--why", help="reasoning text")
     pn.add_argument("--obs", help="observation text")
     pn.set_defaults(func=cmd_note)
+
+    pf = sub.add_parser("frames", help="list cached detector frames / garbage-collect")
+    pf.add_argument("gc", nargs="?", help="pass 'gc' to prune pending frames now")
+    pf.add_argument("-n", type=int, default=30, help="how many to list (default 30)")
+    pf.add_argument("--json", action="store_true")
+    pf.set_defaults(func=cmd_frames)
 
     pr = sub.add_parser("recent", help="show recent actions")
     pr.add_argument("-n", type=int, default=15, help="how many (default 15)")

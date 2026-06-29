@@ -11,5 +11,24 @@
   "data_root": "/path/to/Data",
 
   "_log_glob": "Glob under data_root (recursive). Default '**/*.log'. Files containing 'scanlist' are ignored.",
-  "log_glob": "**/logs/*.log"
+  "log_glob": "**/logs/*.log",
+
+  "_frames": "Optional area-detector frame capture (needs the 'frames' extra: pip install .[frames]). Unset frame_pv -> feature off; everything else works as before.",
+  "_frame_pv": "EPICS areaDetector PVA Image channel to capture from (the NDPluginPva output), e.g. '13SIM1:Pva1:Image'. Use the literal 'synthetic' to test the whole pipeline without pvapy or a beamline.",
+  "frame_pv": "13SIM1:Pva1:Image",
+
+  "_frames_dir": "Where cached frames live. Default: a 'beamlog_frames' dir beside the db (in the Data folder, not the repo).",
+  "frames_dir": "/path/to/Data/beamlog_frames",
+
+  "_frame_timeout": "Seconds to wait for a PV get (default 1.0). Kept short so a down detector never stalls tail.",
+  "frame_timeout": 1.0,
+
+  "_frame_filter": "Optional regex; only commands matching it are captured. Default unset = capture on every completed command. Example below: only scan/count-like commands.",
+  "frame_filter": "^(a|d|mesh|time)?scan|^count\\b|^ct\\b",
+
+  "_frame_ttl_hours": "Pending (un-kept) frames older than this are pruned (default 48).",
+  "frame_ttl_hours": 48,
+
+  "_frame_cache_max_mb": "Cap on the frames dir; over budget, oldest pending frames are evicted (default 2048).",
+  "frame_cache_max_mb": 2048
 }

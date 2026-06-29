@@ -83,9 +83,50 @@ the command + its SPEC output. Type *why*/*observation* and press `Enter` to sav
 and move to the next; `Esc` skips (nothing written, leaves the queue). It runs on
 `127.0.0.1` only and picks up newly-tailed commands automatically.
 
+## Detector frames (optional)
+
+Optionally capture an **area-detector frame** on each command completion. This is
+the **only** part of the project with a runtime dependency, and it's opt-in:
+
+```bash
+pip install -e ".[frames]"     # adds pvapy + numpy, for this feature only
+```
+
+Point it at the detector's EPICS **PVA Image** channel (the `NDPluginPva` output)
+in `beamlog.json`:
+
+```jsonc
+{
+  "frame_pv": "13SIM1:Pva1:Image",   // or "synthetic" to test without a beamline
+  "frame_filter": "^(a|d)?scan|^count\\b"  // optional: only these commands (default: all)
+  // frames_dir, frame_timeout, frame_ttl_hours, frame_cache_max_mb also configurable
+}
+```
+
+While `bl tail` runs, each completed command grabs the **current** frame and
+**caches** it as *pending*: a raw `.npy` (full bit-depth, the corpus artifact)
+plus an 8-bit thumbnail PNG. In the review queue each row then shows the
+thumbnail and a **"keep frame"** checkbox — **unchecked by default**. Save/skip
+*without* checking it discards the frame (files deleted); check it to keep the
+frame as part of the corpus. Pending frames left undecided are pruned by a TTL +
+disk-budget sweep (also runnable via `bl frames gc`; `bl frames` lists them).
+
+Capture is **best-effort and never blocks logging**: a down detector, a missing
+`pvapy`, a compressed codec, or an unsupported color mode just records an `error`
+on the frame row and ingestion continues. Confirm what's configured (and whether
+`pvapy` is importable) with `bl resolve`.
+
+> **Timing caveat:** because beamlog reads a log file, the captured frame reflects
+> detector state ~1 poll *after* the command completed — i.e. "what the detector
+> showed around when this command finished", not a frame intrinsically bound to
+> the command. Mono and RGB1 frames are supported; compressed codecs and
+> RGB2/RGB3 are skipped (decompression would need a C library this project avoids).
+
 ## Testing without a beamline
 
-Replay a recorded SPEC log into a file as if it were live:
+Replay a recorded SPEC log into a file as if it were live (set
+`"frame_pv": "synthetic"` to also exercise the full frame pipeline — no pvapy
+needed):
 
 ```bash
 bl tail /tmp/live.log                                          # terminal 1
@@ -95,17 +136,21 @@ bl gui                                                         # browser
 
 ## Schema
 
-Two tables (`reviewed_at` is queue bookkeeping for the GUI; it never pollutes the
-text columns):
+Two core tables (`reviewed_at` is queue bookkeeping for the GUI; it never
+pollutes the text columns), plus an optional `frames` table:
 
 ```
 experiments(id, created_at, user, material, technique, goal)
 actions(id, experiment_id → experiments, created_at,
         command, output, reasoning, observation, reviewed_at)
+frames(id, action_id → actions, created_at, pv, npy_path, png_path,
+       width, height, dtype, unique_id, kept, decided_at, error)
 ```
 
 - `command` / `output` — captured automatically from the SPEC log.
 - `reasoning` / `observation` — added by a human or agent.
+- `frames` — one optional cached detector frame per action; `kept=0` /
+  `decided_at IS NULL` means *pending* (default outcome is discard).
 
 ## Files
 
@@ -113,12 +158,14 @@ actions(id, experiment_id → experiments, created_at,
 |------|------|
 | `beamlog.py` | core: config resolution, DB, SPEC-log parsing, CLI |
 | `beamlog_gui.py` | browser review-queue annotator (stdlib `http.server`) |
+| `beamlog_frames.py` | optional area-detector capture (pvapy) — isolated, lazy-imported |
 | `replay_spec_log.py` | dev tool: stream a recorded log in as if live |
 | `beamlog.example.json` | config template (copy to gitignored `beamlog.json`) |
 | `pyproject.toml` | provides the `bl` command |
 
-Local configs (`*.json` except `*.example.json`), databases (`*.db`), and logs
-(`*.log`, `test_data/`) are gitignored so no private paths or data are pushed.
+Local configs (`*.json` except `*.example.json`), databases (`*.db`), logs
+(`*.log`, `test_data/`), and cached frames (`*.npy`, `beamlog_frames/`) are
+gitignored so no private paths or data are pushed.
 
 ## Roadmap: Bluesky
 

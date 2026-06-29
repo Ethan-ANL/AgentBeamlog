@@ -7,10 +7,15 @@ name = "AgentBeamlog"
 version = "0.1.0"
 description = "Lightweight capture of beamline actions + reasoning/observation for agent fine-tuning"
 requires-python = ">=3.9"
-dependencies = []                      # stdlib only
+dependencies = []                      # core is stdlib only
+
+[project.optional-dependencies]
+# area-detector frame capture only. Core (logging, GUI, review) needs none of this.
+# Pillow is optional even here -- beamlog_frames falls back to a stdlib PNG writer.
+frames = ["pvapy", "numpy"]
 
 [project.scripts]
 bl = "beamlog:main"
 
 [tool.setuptools]
-py-modules = ["beamlog", "beamlog_gui"]
+py-modules = ["beamlog", "beamlog_gui", "beamlog_frames"]
