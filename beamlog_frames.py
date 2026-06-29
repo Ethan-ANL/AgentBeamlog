@@ -76,6 +76,89 @@ _UNION_DTYPE = {
 _synthetic_counter = 0          # so successive synthetic frames differ
 _channel_cache: dict = {}       # pv name -> live pva.Channel (reused across captures)
 
+# pvData ScalarType code (stored in NTNDArray codec.parameters) -> numpy dtype
+_PVTYPE_DTYPE = {
+    1: "int8", 2: "int16", 3: "int32", 4: "int64",
+    5: "uint8", 6: "uint16", 7: "uint32", 8: "uint64",
+    9: "float32", 10: "float64",
+}
+# fallback when only the byte-width is known (detectors are unsigned counts)
+_BYTES_DTYPE = {1: "uint8", 2: "uint16", 4: "uint32", 8: "uint64"}
+
+
+def _codec_param_code(pv):
+    """Original pixel type code from NTNDArray codec.parameters, or None.
+
+    areaDetector stores the source pixel type here so a compressed buffer (whose
+    `value` union is just bytes) can be reinterpreted after decompression."""
+    try:
+        params = pv["codec"]["parameters"]
+    except Exception:                              # noqa: BLE001 - field absent
+        return None
+    try:
+        if isinstance(params, dict):               # a union -> first active member
+            for v in params.values():
+                if v is not None:
+                    return int(v)
+            return None
+        return int(params)
+    except (TypeError, ValueError):
+        return None
+
+
+def _decompress_bytes(codec: str, raw: bytes, usize: int) -> bytes:
+    """Decompress a raw areaDetector codec buffer. lz4 (the common AD case) and
+    blosc are supported when their package is installed; anything else (bslz4,
+    jpeg, ...) raises FrameError so the caller records it and skips the frame."""
+    if codec == "lz4":
+        try:
+            import lz4.block as _lz4b  # noqa: PLC0415 - optional, lazy
+        except Exception as e:         # noqa: BLE001
+            raise FrameError(f"lz4 codec needs the 'lz4' package (pip install lz4): {e}")
+        try:
+            # AD emits a raw LZ4 block (no header) -> must pass the size.
+            return _lz4b.decompress(raw, uncompressed_size=usize) if usize else _lz4b.decompress(raw)
+        except Exception:              # noqa: BLE001 - some plugins use frame format
+            try:
+                import lz4.frame as _lz4f  # noqa: PLC0415
+                return _lz4f.decompress(raw)
+            except Exception as e:     # noqa: BLE001
+                raise FrameError(f"lz4 decompress failed: {e}")
+    if codec == "blosc":
+        try:
+            import blosc as _blosc  # noqa: PLC0415
+        except Exception as e:        # noqa: BLE001
+            raise FrameError(f"blosc codec needs the 'blosc' package: {e}")
+        try:
+            return _blosc.decompress(raw)
+        except Exception as e:        # noqa: BLE001
+            raise FrameError(f"blosc decompress failed: {e}")
+    raise FrameError(f"codec {codec!r} not supported (lz4/blosc only)")
+
+
+def _decode_compressed(np, pv, codec, buf, member, npix):
+    """Decompress a compressed NTNDArray value buffer -> flat numpy pixel array."""
+    member_dtype = _UNION_DTYPE.get(member, "int8")   # compressed bytes arrive as byte/ubyte
+    raw = np.asarray(buf, dtype=member_dtype).tobytes()
+    try:
+        usize = int(pv["uncompressedSize"])
+    except Exception:                                 # noqa: BLE001
+        usize = 0
+    data = _decompress_bytes(codec, raw, usize)
+    nbytes = usize or len(data)
+    if npix <= 0 or nbytes % npix != 0:
+        raise FrameError(f"can't size frame (bytes={nbytes}, pixels={npix})")
+    bpp = nbytes // npix
+    # prefer the exact type from codec.parameters; fall back to unsigned-by-width,
+    # and override the parameter type if its width disagrees with the byte count.
+    code = _codec_param_code(pv)
+    dtype = _PVTYPE_DTYPE.get(code) if code is not None else None
+    if dtype is None or np.dtype(dtype).itemsize != bpp:
+        dtype = _BYTES_DTYPE.get(bpp)
+    if dtype is None:
+        raise FrameError(f"unsupported pixel size {bpp} bytes")
+    return np.frombuffer(data, dtype=dtype, count=npix)
+
 
 def capture(source: str, *, timeout: float = 1.0, shape=None, dtype="uint16") -> dict:
     """Fetch the current frame from `source`.
@@ -147,14 +230,8 @@ def _capture_pva(pv_name: str, *, timeout: float = 1.0) -> dict:
         _channel_cache.pop(pv_name, None)          # force reconnect next time
         raise FrameError(f"PV get failed for {pv_name}: {e}")
 
-    # compression: the value buffer is opaque without the matching C library.
-    try:
-        codec = (pv["codec"]["name"] or "").strip()
-    except Exception:                              # noqa: BLE001 - field may be absent
-        codec = ""
-    if codec:
-        raise FrameError(f"compressed frame (codec={codec!r}) not supported")
-
+    # dimensions: areaDetector is fast-axis-first -- dimension[0]=X (cols),
+    # dimension[1]=Y (rows); numpy is row-major (rows, cols).
     try:
         dims = list(pv["dimension"])
     except Exception as e:                         # noqa: BLE001
@@ -162,7 +239,7 @@ def _capture_pva(pv_name: str, *, timeout: float = 1.0) -> dict:
     if len(dims) not in (2, 3):
         raise FrameError(f"unsupported dimensionality ({len(dims)} dims)")
 
-    # the active member of the `value` union -> flat pixel buffer + dtype
+    # active member of the `value` union -> raw buffer (compressed if codec set)
     try:
         value = dict(pv["value"])
     except Exception as e:                         # noqa: BLE001
@@ -170,20 +247,31 @@ def _capture_pva(pv_name: str, *, timeout: float = 1.0) -> dict:
     member = next((k for k, v in value.items() if v is not None), None)
     if member is None:
         raise FrameError("empty value union")
-    flat = np.asarray(value[member])
-    np_dtype = _UNION_DTYPE.get(member)
-    if np_dtype and flat.dtype != np.dtype(np_dtype):
-        flat = flat.astype(np_dtype, copy=False)
+    buf = value[member]
 
-    # areaDetector is fast-axis-first: dimension[0]=X (cols), dimension[1]=Y (rows).
-    w = int(dims[0]["size"])
-    h = int(dims[1]["size"])
+    # codec: when set, `buf` is a compressed byte stream.
+    codec = ""
+    try:
+        codec = (pv["codec"]["name"] or "").strip().lower()
+    except Exception:                              # noqa: BLE001 - field may be absent
+        codec = ""
+
+    def _plain(b):
+        flat = np.asarray(b)
+        nd = _UNION_DTYPE.get(member)
+        return flat.astype(nd, copy=False) if (nd and flat.dtype != np.dtype(nd)) else flat
+
     if len(dims) == 2:
+        w = int(dims[0]["size"]); h = int(dims[1]["size"])
+        flat = _decode_compressed(np, pv, codec, buf, member, w * h) if codec else _plain(buf)
         try:
             arr = flat.reshape(h, w)               # numpy is (rows, cols)
         except Exception as e:                     # noqa: BLE001
             raise FrameError(f"reshape {flat.size} -> ({h},{w}) failed: {e}")
     else:
+        if codec:
+            raise FrameError(f"compressed color frame (codec={codec!r}) not supported")
+        flat = _plain(buf)
         # color: only RGB1 (interleaved by pixel, dimension [3, W, H]) is handled.
         if int(dims[0]["size"]) == 3:
             w, h = int(dims[1]["size"]), int(dims[2]["size"])

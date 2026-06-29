@@ -119,8 +119,9 @@ on the frame row and ingestion continues. Confirm what's configured (and whether
 > **Timing caveat:** because beamlog reads a log file, the captured frame reflects
 > detector state ~1 poll *after* the command completed — i.e. "what the detector
 > showed around when this command finished", not a frame intrinsically bound to
-> the command. Mono and RGB1 frames are supported; compressed codecs and
-> RGB2/RGB3 are skipped (decompression would need a C library this project avoids).
+> the command. Mono and RGB1 frames are supported. Compressed NTNDArrays are
+> decoded for the **lz4** codec and **blosc** (if `blosc` is
+> installed); other codecs (bslz4, jpeg) and RGB2/RGB3 color are skipped.
 
 ## Testing without a beamline
 

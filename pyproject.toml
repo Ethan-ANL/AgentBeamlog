@@ -12,7 +12,8 @@ dependencies = []                      # core is stdlib only
 [project.optional-dependencies]
 # area-detector frame capture only. Core (logging, GUI, review) needs none of this.
 # Pillow is optional even here -- beamlog_frames falls back to a stdlib PNG writer.
-frames = ["pvapy", "numpy"]
+# lz4 decodes compressed NTNDArray frames.
+frames = ["pvapy", "numpy", "lz4"]
 
 [project.scripts]
 bl = "beamlog:main"
