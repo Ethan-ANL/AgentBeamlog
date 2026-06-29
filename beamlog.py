@@ -276,10 +276,21 @@ def connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    # tail and gui both write now (actions + frames); WAL + a busy timeout keep
-    # concurrent writers from tripping over "database is locked".
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA busy_timeout = 3000")
+    # The DB normally lives on the shared/NFS Data folder, reached from several
+    # beamline desktops. WAL mode is UNSAFE there -- it needs shared memory and a
+    # single host, and on a network FS it surfaces as "attempt to write a
+    # readonly database". So we keep SQLite's default rollback journal (works on
+    # NFS and across machines) and only widen the lock wait, which is the safe way
+    # to let `tail` and `gui` write concurrently.
+    conn.execute("PRAGMA busy_timeout = 5000")
+    # If an earlier build left this DB in WAL mode, flip it back so it's portable
+    # again (no-op if already in a rollback journal mode).
+    try:
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        if str(mode).lower() == "wal":
+            conn.execute("PRAGMA journal_mode = DELETE")
+    except sqlite3.Error:
+        pass
     conn.executescript(SCHEMA)
     _migrate(conn)
     return conn
